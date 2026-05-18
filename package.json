@@ -1,0 +1,22 @@
+{
+  "name": "pi-ios-notify",
+  "version": "1.0.0",
+  "description": "Send iOS push notifications via Bark when pi completes agent turns",
+  "keywords": ["pi-package"],
+  "author": "",
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  }
+}
