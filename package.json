@@ -1,6 +1,6 @@
 {
   "name": "@aslamplr/pi-ios-notify",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Send iOS push notifications via Bark when pi completes agent turns",
   "keywords": ["pi-package", "pi-extension", "notifications", "ios", "bark"],
   "license": "MIT",
