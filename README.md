@@ -170,6 +170,17 @@ Use `default` to reset to Bark's default icon, or `pi` to use the pi logo:
 /ios-notify icon default
 ```
 
+### Notification URL
+
+Set a URL that opens when the notification is tapped. Supports any URL scheme:
+
+```
+/ios-notify url ssh://user@myserver          # opens Termius/Blink (SSH)
+/ios-notify url https://my-dashboard.com      # opens Safari
+/ios-notify url pi://settings                 # custom scheme
+/ios-notify url ""                            # clear (no-op on tap)
+```
+
 ### Debug mode
 
 Enable debug logging to see why notifications are or aren't firing:
