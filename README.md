@@ -99,7 +99,8 @@ You should receive a "🔔 Test" notification on your iPhone within a second or 
 | `/ios-notify prompt-tools clear` | Remove all prompt tools |
 | `/ios-notify sound <name>` | Set notification sound |
 | `/ios-notify icon <url|pi|default>` | Set a custom notification icon |
-| `/ios-notify debug <on\|off>` | Enable/disable debug logging to stderr |
+| `/ios-notify url <value>` | Set optional URL to open when notification is tapped (URL scheme, e.g. `ssh://user@host`) |
+| `/ios-notify debug <on\|off>` | Enable/disable debug logging |
 | `/ios-notify hostname <true\|false>` | Append hostname to notifications |
 
 ### Notification events
@@ -224,7 +225,8 @@ The extension stores its config at `~/.pi/ios-notify.json`. You can edit it dire
   "sound": "default",
   "title": "pi",
   "icon": "",
-  "showHostname": false
+  "showHostname": false,
+  "url": ""
 }
 ```
 

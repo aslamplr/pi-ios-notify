@@ -33,6 +33,10 @@ interface Config {
   icon: string;
   /** Include the hostname so you know which machine sent it */
   showHostname: boolean;
+  /** Optional URL to open when notification is tapped (URL scheme) */
+  url: string;
+  /** Enable debug logging */
+  debug: boolean;
 }
 
 const DEFAULT_CONFIG: Config = {
@@ -53,6 +57,8 @@ const DEFAULT_CONFIG: Config = {
   title: "pi",
   icon: defaults.icon,
   showHostname: false,
+  url: "",
+  debug: false,
 };
 
 // ── Config persistence ─────────────────────────────────────────────
@@ -119,6 +125,7 @@ async function sendNotification(config: Config, titleSuffix: string, body: strin
   };
 
   if (config.icon) payload.icon = config.icon;
+  if (config.url) payload.url = config.url;
 
   try {
     const response = await fetch(url, {
@@ -271,6 +278,7 @@ export default async function (pi: ExtensionAPI) {
           const toolNames = Object.keys(config.promptTools);
           lines.push(`Prompt tools: ${toolNames.length ? toolNames.join(", ") : "none"}`);
           lines.push(`Sound: ${config.sound}  Icon: ${config.icon ? "✅" : "default"}  Debug: ${onOff(config.debug)}`);
+          lines.push(`URL: ${config.url || "not set"}`);
 
           ctx.ui.notify(`📱 pi-ios-notify status\n${lines.join("\n")}`, "info");
           return;
@@ -393,6 +401,15 @@ export default async function (pi: ExtensionAPI) {
           return;
         }
 
+        // ── url ───────────────────────────────────────────
+        case "url": {
+          const urlVal = parts.slice(1).join(" ");
+          config.url = urlVal;
+          await saveConfig(config);
+          ctx.ui.notify(`${urlVal ? `✅ URL set to "${urlVal}"` : "✅ URL cleared"}`, "info");
+          return;
+        }
+
         // ── debug ────────────────────────────────────────
         case "debug": {
           const val = parseBool(parts[1]);
@@ -421,7 +438,7 @@ export default async function (pi: ExtensionAPI) {
 
         default: {
           ctx.ui.notify(
-            "Commands: setup, test, status, events <agent-end|prompt-tools|turn-end|error> <bool>, prompt-tools <list|add|remove|clear>, sound <name>, icon <url|pi|default>, hostname <bool>",
+            "Commands: setup, test, status, events <agent-end|prompt-tools|turn-end|error> <bool>, prompt-tools <list|add|remove|clear>, sound <name>, icon <url|pi|default>, url <value>, debug <on|off>, hostname <bool>",
             "info",
           );
           return;
