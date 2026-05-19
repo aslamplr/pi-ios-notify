@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import { join, dirname } from "node:path";
@@ -14,15 +14,17 @@ interface Config {
   barkServer: string;
   /** Which events trigger notifications */
   events: {
-    /** Notify when agent finishes and needs user input */
-    idle: boolean;
+    /** Notify when agent finishes a response */
+    agentEnd: boolean;
+    /** Notify mid-turn when a configured prompt tool is called */
+    promptTools: boolean;
     /** Notify after each individual LLM turn */
     turnEnd: boolean;
     /** Notify on tool execution errors */
     error: boolean;
-    /** Notify when agent requests permission (bash, file writes, etc.) */
-    permission: boolean;
   };
+  /** Map of tool names to notification labels (e.g. ask_user: "Asking") */
+  promptTools: Record<string, string>;
   /** iOS notification sound. "default" uses the system default. */
   sound: string;
   /** Notification title prefix shown on the lock screen */
@@ -37,10 +39,15 @@ const DEFAULT_CONFIG: Config = {
   barkKey: "",
   barkServer: "https://api.day.app",
   events: {
-    idle: true,
+    agentEnd: true,
+    promptTools: true,
     turnEnd: false,
     error: true,
-    permission: true,
+  },
+  promptTools: {
+    ask_user: "Asking",
+    "ask-user": "Asking",
+    safe_shell_approve: "Permission",
   },
   sound: "default",
   title: "pi",
@@ -57,7 +64,13 @@ function getConfigPath(): string {
 async function loadConfig(): Promise<Config> {
   try {
     const raw = await readFile(getConfigPath(), "utf-8");
-    return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+    const saved = JSON.parse(raw);
+    return {
+      ...DEFAULT_CONFIG,
+      ...saved,
+      events: { ...DEFAULT_CONFIG.events, ...saved.events },
+      promptTools: { ...DEFAULT_CONFIG.promptTools, ...saved.promptTools },
+    };
   } catch {
     return { ...DEFAULT_CONFIG };
   }
@@ -67,6 +80,13 @@ async function saveConfig(config: Config): Promise<void> {
   const configPath = getConfigPath();
   await mkdir(dirname(configPath), { recursive: true });
   await writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
+}
+
+// ── Debug logging ─────────────────────────────────────────────────
+
+function debugLog(ctx: ExtensionContext, config: Config, msg: string): void {
+  if (!config.debug) return;
+  ctx.ui.notify(`🔍 ${msg}`, "info");
 }
 
 // ── Bark notification ──────────────────────────────────────────────
@@ -123,7 +143,8 @@ export default async function (pi: ExtensionAPI) {
   // Track state across events in the same prompt cycle
   let currentPrompt = "";
   let turnCount = 0;
-  let notifiedPermissionThisTurn = false;
+  let notifiedErrorThisTurn = false;
+  let notifiedPromptToolThisTurn = false;
 
   // ── Notify user on first load if unconfigured ────────────────
   if (!config.barkKey) {
@@ -136,15 +157,18 @@ export default async function (pi: ExtensionAPI) {
   }
 
   // ── Capture user prompts & reset per-turn state ──────────
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
+    debugLog(ctx, config, `before_agent_start prompt="${formatPrompt(event.prompt)}"`);
     currentPrompt = event.prompt;
     turnCount = 0;
-    notifiedPermissionThisTurn = false;
+    notifiedErrorThisTurn = false;
+    notifiedPromptToolThisTurn = false;
   });
 
-  // ── Agent idle — needs user input ───────────────────────
-  pi.on("agent_end", async () => {
-    if (!config.events.idle || !config.barkKey) return;
+  // ── Agent completed a response ───────────────────────
+  pi.on("agent_end", async (_event, ctx) => {
+    debugLog(ctx, config, `agent_end agentEnd=${config.events.agentEnd}`);
+    if (!config.events.agentEnd || !config.barkKey) return;
 
     let body: string;
 
@@ -155,48 +179,55 @@ export default async function (pi: ExtensionAPI) {
         body = `"${formatPrompt(currentPrompt)}"`;
       }
     } else {
-      body = `Waiting for input (${turnCount} ${pluralize(turnCount, "turn", "turns")})`;
+      body = `Completed (${turnCount} ${pluralize(turnCount, "turn", "turns")})`;
     }
 
-    await sendNotification(config, "💬 Needs input", body);
+    await sendNotification(config, "✅ Complete", body);
     currentPrompt = "";
     turnCount = 0;
-    notifiedPermissionThisTurn = false;
+    notifiedErrorThisTurn = false;
+    notifiedPromptToolThisTurn = false;
   });
 
   // ── Per-turn notification (optional) ─────────────────────────
-  pi.on("turn_end", async (event) => {
+  pi.on("turn_end", async (event, ctx) => {
     turnCount++;
+    debugLog(ctx, config, `turn_end index=${event.turnIndex} turnEnd=${config.events.turnEnd}`);
     if (!config.events.turnEnd || !config.barkKey) return;
     await sendNotification(config, "🔄 Turn", `Turn ${event.turnIndex} finished`);
   });
 
-  // ── Error notification ───────────────────────────────────────
-  pi.on("tool_result", async (event) => {
+  // ── Error notification (throttled: once per turn) ──────────
+  pi.on("tool_result", async (event, ctx) => {
+    debugLog(ctx, config, `tool_result name=${event.toolName} isError=${event.isError} error=${config.events.error} throttled=${notifiedErrorThisTurn}`);
     if (!config.events.error || !config.barkKey) return;
-    if (event.isError) {
-      const toolLabel = event.toolName ?? "unknown";
-      await sendNotification(config, "⚠️ Error", `Error in ${toolLabel}`);
-    }
+    if (notifiedErrorThisTurn) return;
+    if (!event.isError) return;
+
+    notifiedErrorThisTurn = true;
+    const toolLabel = event.toolName ?? "unknown";
+    await sendNotification(config, "⚠️ Error", `Error in ${toolLabel}`);
   });
 
-  // ── Permission notification — agent wants to run sensitive tools ──
-  const PERMISSION_TOOLS = new Set(["bash", "write", "edit", "rm", "mv", "sudo"]);
+  // ── Prompt tool notification (throttled: once per turn) ──
+  pi.on("tool_call", async (event, ctx) => {
+    const label = config.promptTools[event.toolName];
+    debugLog(ctx, config, `tool_call name=${event.toolName} inPromptTools=${!!label} promptTools=${config.events.promptTools} throttled=${notifiedPromptToolThisTurn}`);
+    if (!config.events.promptTools || !config.barkKey) return;
+    if (notifiedPromptToolThisTurn) return;
+    if (!label) return;
 
-  pi.on("tool_call", async (event) => {
-    if (!config.events.permission || !config.barkKey) return;
-    if (notifiedPermissionThisTurn) return;
-    if (!PERMISSION_TOOLS.has(event.toolName)) return;
+    notifiedPromptToolThisTurn = true;
+    await sendNotification(config, label, event.toolName);
+  });
 
-    notifiedPermissionThisTurn = true;
-
-    let detail = event.toolName;
-    if (event.toolName === "bash" && event.input?.command) {
-      const cmd = (event.input.command as string).slice(0, 80);
-      detail = `bash: ${cmd}${cmd.length >= 80 ? "…" : ""}`;
-    }
-
-    await sendNotification(config, "🔑 Permission", `${detail}`);
+  // ── Cross-extension notification event ─────────────────────
+  // Any extension can emit pi-ios-notify:notify with { title, body, source? }
+  pi.events.on("pi-ios-notify:notify", (data: unknown) => {
+    const { title, body } = data as { title?: string; body?: string };
+    if (!title || !body) return;
+    if (!config.events.promptTools || !config.barkKey) return;
+    sendNotification(config, title, body);
   });
 
   // ── /ios-notify command ──────────────────────────────────────
@@ -226,6 +257,7 @@ export default async function (pi: ExtensionAPI) {
             ctx.ui.notify("❌ No Bark key set. Run /ios-notify setup first.", "error");
             return;
           }
+          debugLog(ctx, config, "send test notification");
           await sendNotification(config, "🔔 Test", "iOS notifications are working!");
           ctx.ui.notify("📱 Test notification sent! Check your iPhone.", "success");
           return;
@@ -234,16 +266,13 @@ export default async function (pi: ExtensionAPI) {
         // ── status ────────────────────────────────────────
         case "status": {
           const lines: string[] = [];
-          lines.push(`**Bark:** ${config.barkKey ? "✅ Configured" : "❌ Not set"}`);
-          lines.push(`**Server:** ${config.barkServer}`);
-          lines.push(`**Events:** idle ${onOff(config.events.idle)} · turn-end ${onOff(config.events.turnEnd)} · errors ${onOff(config.events.error)} · permission ${onOff(config.events.permission)}`);
-          lines.push(`**Sound:** ${config.sound}  **Icon:** ${config.icon ? "✅ Set" : "Default"}`);
+          lines.push(`Bark: ${config.barkKey ? "✅" : "❌"}  Server: ${config.barkServer}`);
+          lines.push(`Events: agent-end:${onOff(config.events.agentEnd)}  prompt-tools:${onOff(config.events.promptTools)}  turn-end:${onOff(config.events.turnEnd)}  errors:${onOff(config.events.error)}`);
+          const toolNames = Object.keys(config.promptTools);
+          lines.push(`Prompt tools: ${toolNames.length ? toolNames.join(", ") : "none"}`);
+          lines.push(`Sound: ${config.sound}  Icon: ${config.icon ? "✅" : "default"}  Debug: ${onOff(config.debug)}`);
 
-          pi.sendMessage({
-            customType: "ios-notify-status",
-            content: `📱 **pi-ios-notify status**\n${lines.join("\n")}`,
-            display: true,
-          });
+          ctx.ui.notify(`📱 pi-ios-notify status\n${lines.join("\n")}`, "info");
           return;
         }
 
@@ -253,23 +282,82 @@ export default async function (pi: ExtensionAPI) {
           const value = parseBool(parts[2]);
 
           if (!event || value === undefined) {
-            ctx.ui.notify("Usage: /ios-notify events <idle|turn-end|error|permission> <true|false>", "error");
+            ctx.ui.notify("Usage: /ios-notify events <agent-end|prompt-tools|turn-end|error> <true|false>", "error");
             return;
           }
 
           let changed = false;
-          if (event === "idle") { config.events.idle = value; changed = true; }
+          if (event === "agent-end") { config.events.agentEnd = value; changed = true; }
+          if (event === "prompt-tools") { config.events.promptTools = value; changed = true; }
           if (event === "turn-end") { config.events.turnEnd = value; changed = true; }
           if (event === "error") { config.events.error = value; changed = true; }
-          if (event === "permission") { config.events.permission = value; changed = true; }
 
           if (!changed) {
-            ctx.ui.notify(`Unknown event "${event}". Options: idle, turn-end, error, permission`, "error");
+            ctx.ui.notify(`Unknown event "${event}". Options: agent-end, prompt-tools, turn-end, error`, "error");
             return;
           }
 
           await saveConfig(config);
           ctx.ui.notify(`✅ Event "${event}" → ${onOff(value)}`, "info");
+          return;
+        }
+
+        // ── prompt-tools ─────────────────────────────────
+        case "prompt-tools": {
+          const sub = parts[1]?.toLowerCase();
+
+          if (sub === "list") {
+            const names = Object.keys(config.promptTools);
+            if (names.length === 0) {
+              ctx.ui.notify("No prompt tools configured.", "info");
+            } else {
+              const formatted = names.map(n => `  • ${n} → "${config.promptTools[n]}"`).join("\n");
+              pi.sendMessage({
+                customType: "ios-notify-prompt-tools",
+                content: `🔧 **Configured prompt tools:**\n${formatted}`,
+                display: true,
+              });
+            }
+            return;
+          }
+
+          if (sub === "add") {
+            const toolName = parts[2];
+            const label = parts.slice(3).join(" ") || toolName;
+            if (!toolName) {
+              ctx.ui.notify("Usage: /ios-notify prompt-tools add <tool-name> [label]", "error");
+              return;
+            }
+            config.promptTools[toolName] = label;
+            await saveConfig(config);
+            ctx.ui.notify(`✅ Added "${toolName}" → "${label}"`, "info");
+            return;
+          }
+
+          if (sub === "remove") {
+            const toolName = parts[2];
+            if (!toolName) {
+              ctx.ui.notify("Usage: /ios-notify prompt-tools remove <tool-name>", "error");
+              return;
+            }
+            if (!config.promptTools[toolName]) {
+              ctx.ui.notify(`"${toolName}" not in configured prompt tools.`, "error");
+              return;
+            }
+            delete config.promptTools[toolName];
+            await saveConfig(config);
+            ctx.ui.notify(`✅ Removed "${toolName}"`, "info");
+            return;
+          }
+
+          if (sub === "clear") {
+            config.promptTools = {};
+            await saveConfig(config);
+            ctx.ui.notify("✅ All prompt tools cleared.", "info");
+            return;
+          }
+
+          ctx.ui.notify("Usage: /ios-notify prompt-tools <list|add|remove|clear> ...", "error");
           return;
         }
 
@@ -305,6 +393,19 @@ export default async function (pi: ExtensionAPI) {
           return;
         }
 
+        // ── debug ────────────────────────────────────────
+        case "debug": {
+          const val = parseBool(parts[1]);
+          if (val === undefined) {
+            ctx.ui.notify("Usage: /ios-notify debug <on|off>", "error");
+            return;
+          }
+          config.debug = val;
+          await saveConfig(config);
+          ctx.ui.notify(`✅ Debug logging → ${onOff(val)}`, "info");
+          return;
+        }
+
         // ── hostname ──────────────────────────────────────
         case "hostname": {
           const val = parseBool(parts[1]);
@@ -320,7 +421,7 @@ export default async function (pi: ExtensionAPI) {
 
         default: {
           ctx.ui.notify(
-            "Commands: setup, test, status, events <idle|turn-end|error|permission> <bool>, sound <name>, icon <url|pi|default>, hostname <bool>",
+            "Commands: setup, test, status, events <agent-end|prompt-tools|turn-end|error> <bool>, prompt-tools <list|add|remove|clear>, sound <name>, icon <url|pi|default>, hostname <bool>",
             "info",
           );
           return;
