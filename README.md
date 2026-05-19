@@ -326,6 +326,15 @@ Runs [vitest](https://vitest.dev/) on the extracted utility functions (`utils.te
 - `onOff` — boolean to on/off
 - `parseBool` — all truthy/falsy strings, edge cases
 
+## ⚖️ No Warranty
+
+**THIS SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.** The authors make no representations that this extension will deliver notifications reliably or in a timely manner. You are responsible for testing notification delivery and configuring appropriate settings.
+
+---
+
+## License
+
+MIT
 
 ## Credits
 
